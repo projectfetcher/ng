@@ -34,7 +34,7 @@ jobs:
           python -c "import nltk; nltk.download('punkt_tab', quiet=True); nltk.download('averaged_perceptron_tagger', quiet=True)"
 
       - name: Run job script
-        run: python ng.py
+        run: python run_colab.py
 
       - name: Upload tracker CSV
         if: always()
