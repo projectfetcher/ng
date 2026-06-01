@@ -41,5 +41,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: processed-jobs-tracker
-          path: ng_processed_job_ids.csv
+          path: kenya_processed_job_ids.csv
           retention-days: 30
