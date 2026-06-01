@@ -1,4 +1,4 @@
-name: Run ng
+name: Run Kenya MimusJobs
 
 on:
   schedule:
