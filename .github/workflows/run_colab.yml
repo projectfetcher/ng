@@ -1,4 +1,4 @@
-name: Run Kenya MimusJobs
+name: Run Nigeria MimusJobs
 
 on:
   schedule:
@@ -16,6 +16,7 @@ jobs:
       WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
       WP_USERNAME: ${{ secrets.WP_USERNAME }}
       WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+      INTERNAL_BOT_KEY: ${{ secrets.INTERNAL_BOT_KEY }}   # FIX: added — required for Cloudflare X-Internal-Auth bypass
 
     steps:
       - name: Checkout repository
@@ -41,5 +42,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: processed-jobs-tracker
-          path: kenya_processed_job_ids.csv
+          path: nigeria_processed_job_ids.csv
           retention-days: 30
