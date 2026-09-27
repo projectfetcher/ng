@@ -65,6 +65,14 @@ def get_secret(name: str, fallback: str = "") -> str:
         f"   Then add '{name}' as a repository secret.\n"
     )
 
+def get_optional_secret(name: str) -> str:
+    """
+    Like get_secret(), but never raises — returns "" if not set.
+    Used for INTERNAL_BOT_KEY so the script can still run (with a loud
+    warning) even before the secret has been added to every repo.
+    """
+    return os.environ.get(name, "").strip()
+
 # ── Load all secrets ──────────────────────────────────────────────────────
 MISTRAL_API_KEY = get_secret("MISTRAL_API_KEY")
 MISTRAL_MODEL   = "mistral-small-latest"
@@ -78,6 +86,25 @@ WP_COMPANY_URL  = f"{WP_BASE}/companies"
 WP_MEDIA_URL    = f"{WP_BASE}/media"
 WP_USERNAME     = get_secret("WP_USERNAME")
 WP_APP_PASSWORD = get_secret("WP_APP_PASSWORD")
+
+# FIX: this script previously had NO X-Internal-Auth support at all — every
+# request it made to WordPress went out without the header your Cloudflare
+# rule checks for. That's the concrete reason Nigeria/Kenya kept tripping
+# the "RL-01 wp-json oembed throttle" rate limit rule even after the other
+# two scrapers were fixed. Loaded here as optional (not get_secret) so the
+# script still runs — just loudly warns — until the secret is added.
+INTERNAL_BOT_KEY = get_optional_secret("INTERNAL_BOT_KEY")
+
+print("=" * 80)
+if INTERNAL_BOT_KEY:
+    print(f"[STARTUP CHECK] INTERNAL_BOT_KEY is SET (length={len(INTERNAL_BOT_KEY)}) "
+          f"— X-Internal-Auth header WILL be sent on every WordPress request.")
+else:
+    print("[STARTUP CHECK] INTERNAL_BOT_KEY is EMPTY/MISSING "
+          "— X-Internal-Auth header will NOT be sent. Add it as a GitHub "
+          "Actions secret for THIS repo (Kenya and/or Nigeria) if you rely "
+          "on it to bypass a Cloudflare WAF/rate-limit rule.")
+print("=" * 80)
 
 # ── Non-sensitive config ──────────────────────────────────────────────────
 PROCESSED_IDS_FILE = "nigeria_processed_job_ids.csv"
@@ -415,7 +442,6 @@ def paraphrase_description(text: str) -> str:
 
         print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
         print(f" │ │ ORIGINAL ({orig_wc} words):")
-        # Word-wrap original at ~100 chars
         orig_words = para.split()
         orig_line = []
         for w in orig_words:
@@ -450,7 +476,6 @@ def paraphrase_description(text: str) -> str:
             rw = len(result.split()) if result else 0
             sim = similarity_score(para, result) if result and rw >= 5 else 0.0
 
-            # Print paraphrased output word-wrapped
             if result:
                 print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
                 words = result.split()
@@ -489,7 +514,6 @@ def paraphrase_description(text: str) -> str:
             print(f" │ │ {'─'*60}")
             time.sleep(1)
 
-        # Fallback logic
         if accepted_text is None:
             print(f" │ │ {'─'*60}")
             if best_result and best_sim >= 0.40:
@@ -610,13 +634,20 @@ def paraphrase_tagline(text: str) -> str:
         print(f" └{'─'*65}")
         time.sleep(1)
         return clean
-        
+
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 10 — WordPress helpers
 # ════════════════════════════════════════════════════════════════════════════
 def wp_headers():
+    # FIX: previously this returned only Authorization + Content-Type, with
+    # no X-Internal-Auth header at all — so this script's traffic could never
+    # be recognised as "trusted" by any Cloudflare rule checking for it,
+    # unlike the other two scrapers which already sent this header.
     token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    if INTERNAL_BOT_KEY:
+        headers["X-Internal-Auth"] = INTERNAL_BOT_KEY
+    return headers
 
 def upload_logo(logo_url: str):
     logo_url = sanitize_text(logo_url, is_url=True)
@@ -909,6 +940,6 @@ def process_sheet():
 # STEP 13 — Entry point
 # ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("\n🚀 Nigeria MimusJobs — Starting with Mistral API…\n")
+    print("\n🚀 MimusJobs — Starting with Mistral API…\n")
     process_sheet()
     print("\n✅ Done. All jobs processed.")
