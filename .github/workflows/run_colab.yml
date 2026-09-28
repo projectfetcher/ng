@@ -2,7 +2,7 @@ name: Run Nigeria MimusJobs
 
 on:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "29 0,3,6,9,12,15,18,21 * * *"
   workflow_dispatch:
 
 jobs:
