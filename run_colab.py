@@ -65,14 +65,6 @@ def get_secret(name: str, fallback: str = "") -> str:
         f"   Then add '{name}' as a repository secret.\n"
     )
 
-def get_optional_secret(name: str) -> str:
-    """
-    Like get_secret(), but never raises — returns "" if not set.
-    Used for INTERNAL_BOT_KEY so the script can still run (with a loud
-    warning) even before the secret has been added to every repo.
-    """
-    return os.environ.get(name, "").strip()
-
 # ── Load all secrets ──────────────────────────────────────────────────────
 MISTRAL_API_KEY = get_secret("MISTRAL_API_KEY")
 MISTRAL_MODEL   = "mistral-small-latest"
@@ -87,27 +79,25 @@ WP_MEDIA_URL    = f"{WP_BASE}/media"
 WP_USERNAME     = get_secret("WP_USERNAME")
 WP_APP_PASSWORD = get_secret("WP_APP_PASSWORD")
 
-# FIX: this script previously had NO X-Internal-Auth support at all — every
-# request it made to WordPress went out without the header your Cloudflare
-# rule checks for. That's the concrete reason Nigeria/Kenya kept tripping
-# the "RL-01 wp-json oembed throttle" rate limit rule even after the other
-# two scrapers were fixed. Loaded here as optional (not get_secret) so the
-# script still runs — just loudly warns — until the secret is added.
-INTERNAL_BOT_KEY = get_optional_secret("INTERNAL_BOT_KEY")
-
+# Sent as the X-Internal-Auth header on every WordPress request so the
+# Cloudflare Skip rule (header X-Internal-Auth == this value) lets it through.
+INTERNAL_BOT_KEY = os.environ.get("INTERNAL_BOT_KEY", "").strip()
 print("=" * 80)
 if INTERNAL_BOT_KEY:
     print(f"[STARTUP CHECK] INTERNAL_BOT_KEY is SET (length={len(INTERNAL_BOT_KEY)}) "
           f"— X-Internal-Auth header WILL be sent on every WordPress request.")
 else:
-    print("[STARTUP CHECK] INTERNAL_BOT_KEY is EMPTY/MISSING "
-          "— X-Internal-Auth header will NOT be sent. Add it as a GitHub "
-          "Actions secret for THIS repo (Kenya and/or Nigeria) if you rely "
-          "on it to bypass a Cloudflare WAF/rate-limit rule.")
+    print("[STARTUP CHECK] INTERNAL_BOT_KEY is EMPTY/MISSING — X-Internal-Auth header will NOT be sent.")
 print("=" * 80)
 
-# ── Non-sensitive config ──────────────────────────────────────────────────
-PROCESSED_IDS_FILE = "nigeria_processed_job_ids.csv"
+# ── Country (set COUNTRY_NAME in the workflow; defaults to Nigeria) ─────────
+COUNTRY_NAME = os.environ.get("COUNTRY_NAME", "").strip() or "Nigeria"
+COUNTRY_SLUG = re.sub(r"[^a-z0-9]+", "_", COUNTRY_NAME.lower()).strip("_")
+
+# ── Tracker CSV (same naming/format as processed_jobs_saudi_arabia.csv) ───
+PROCESSED_IDS_FILE = f"processed_jobs_{COUNTRY_SLUG}.csv"
+LEGACY_TRACKER_FILE = f"{COUNTRY_SLUG}_processed_job_ids.csv"   # old name, migrated automatically
+
 JOB_TYPE_MAPPING = {
     "full-time": "full-time", "full time": "full-time", "fulltime": "full-time",
     "part-time": "part-time", "part time": "part-time", "parttime": "part-time",
@@ -117,7 +107,7 @@ JOB_TYPE_MAPPING = {
     "internship": "internship", "intern": "internship",
     "volunteer": "volunteer",
 }
-print("✅ Secrets loaded successfully.\n")
+print(f"✅ Secrets loaded successfully. Country: {COUNTRY_NAME} | Tracker: {PROCESSED_IDS_FILE} | Bot key: {'set' if INTERNAL_BOT_KEY else 'NOT set'}\n")
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 4 — Column definitions
@@ -262,6 +252,8 @@ def similarity_score(a: str, b: str) -> float:
 
 def clean_output(text: str) -> str:
     text = _fix_mojibake(text)
+    # strip LanguageTool rate-limit artifacts
+    text = re.sub(r"\(suggestion limit reached\)", "", text, flags=re.I)
     for pat in [r"\[/?INST\]", r"</?s>",
                 r"(?i)(rewritten?|rephrased?|output|paraphrase[d]?)[:\s]+",
                 r"\*\*", r"###", r"---"]:
@@ -281,45 +273,119 @@ def make_job_id(row: pd.Series, idx: int) -> str:
     return hashlib.md5(seed.encode()).hexdigest()[:16]
 
 # ════════════════════════════════════════════════════════════════════════════
-# STEP 7 — Duplicate tracker
+# STEP 7 — Duplicate tracker  (same format as processed_jobs_saudi_arabia.csv)
 # ════════════════════════════════════════════════════════════════════════════
+TRACKER_COLUMNS = [
+    "Job ID", "Job URL", "Job Title", "Company Name",
+    "Status", "Timestamp", "WP ID",
+    "Short Description", "Location", "Job Type", "Job Site URL",
+    "Sheet Row",
+]
+
+def _normalise_legacy_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Old rows stored 'posted|wp_id=123|https://…' in Status. Split them into proper columns."""
+    for i, s in df["Status"].items():
+        if str(s).startswith("posted|"):
+            wp_id, url = "", ""
+            for part in str(s).split("|")[1:]:
+                if part.startswith("wp_id="):
+                    wp_id = part[len("wp_id="):]
+                elif part.startswith("http"):
+                    url = part
+            df.at[i, "Status"] = "posted"
+            if not df.at[i, "WP ID"]:
+                df.at[i, "WP ID"] = wp_id
+            if not df.at[i, "Job Site URL"]:
+                df.at[i, "Job Site URL"] = url
+    return df
+
+def _read_tracker(path: str = None) -> pd.DataFrame:
+    """Read tracker as strings so mixed/new columns never cause dtype errors."""
+    df = pd.read_csv(path or PROCESSED_IDS_FILE, dtype=str, keep_default_na=False)
+    for col in TRACKER_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df = _normalise_legacy_status(df)
+    return df[TRACKER_COLUMNS + [c for c in df.columns if c not in TRACKER_COLUMNS]]
+
 def _init_tracker():
-    if not os.path.exists(PROCESSED_IDS_FILE):
-        pd.DataFrame(columns=[
-            "Job ID", "Job URL", "Job Title", "Company Name",
-            "Status", "Timestamp", "Sheet Row",
-        ]).to_csv(PROCESSED_IDS_FILE, index=False)
+    """Create the tracker, migrate the legacy file, or upgrade an older tracker in place."""
+    if os.path.exists(PROCESSED_IDS_FILE):
+        _read_tracker().to_csv(PROCESSED_IDS_FILE, index=False)
+    elif os.path.exists(LEGACY_TRACKER_FILE):
+        logger.info(f"Migrating legacy tracker {LEGACY_TRACKER_FILE} → {PROCESSED_IDS_FILE}")
+        _read_tracker(LEGACY_TRACKER_FILE).to_csv(PROCESSED_IDS_FILE, index=False)
+    else:
+        pd.DataFrame(columns=TRACKER_COLUMNS).to_csv(PROCESSED_IDS_FILE, index=False)
 
 def load_processed_ids() -> tuple:
     _init_tracker()
-    df = pd.read_csv(PROCESSED_IDS_FILE)
+    df = _read_tracker()
     return (
-        set(df["Job ID"].fillna("").astype(str)),
-        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
+        set(df["Job ID"].astype(str)),
+        set(df["Job URL"].astype(str)),
     )
 
 def _upsert_row(job_id: str, updates: dict):
     _init_tracker()
-    df = pd.read_csv(PROCESSED_IDS_FILE)
+    df   = _read_tracker()
     mask = df["Job ID"].astype(str) == str(job_id)
     if mask.any():
         for col, val in updates.items():
             if col in df.columns:
-                df.loc[mask, col] = val
+                df.loc[mask, col] = "" if val is None else str(val)
         df.loc[mask, "Timestamp"] = datetime.now().isoformat()
     else:
-        row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
-        row.update(updates)
+        row = {c: "" for c in df.columns}
+        row["Job ID"] = job_id
+        row["Timestamp"] = datetime.now().isoformat()
+        row.update({k: ("" if v is None else str(v)) for k, v in updates.items() if k in row})
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df.to_csv(PROCESSED_IDS_FILE, index=False)
+
+SHORT_DESC_LEN = 220
+
+def make_short_description(text: str, limit: int = SHORT_DESC_LEN) -> str:
+    """~220-char plain-text summary, cut on a word boundary."""
+    text = sanitize_text(text or "")
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[\u2022\*\-]{1,2}\s+", "", text)      # bullets
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:.-") + "\u2026"
+
+def _pretty_job_type(raw: str) -> str:
+    t = JOB_TYPE_MAPPING.get((raw or "").lower().strip(), (raw or "").strip().lower())
+    return t.replace("-", " ").title() if t else ""
 
 def mark_read(job_id, job_url, title, company, sheet_row):
     _upsert_row(job_id, {"Job URL": job_url, "Job Title": title,
                           "Company Name": company, "Status": "read",
                           "Sheet Row": sheet_row})
 
-def mark_posted(job_id, wp_id, wp_url):
-    _upsert_row(job_id, {"Status": f"posted|wp_id={wp_id}|{wp_url}"})
+def mark_paraphrased(job_id):
+    _upsert_row(job_id, {"Status": "paraphrased"})
+
+def mark_posted(job_id, wp_id, wp_url, info: dict | None = None):
+    # Always store a usable WordPress URL (fallback to ?p=ID)
+    if not wp_url and wp_id and WP_BASE:
+        wp_url = f"{WP_BASE.replace('/wp-json/wp/v2', '')}/?p={wp_id}"
+    updates = {
+        "Status": "posted",
+        "WP ID": wp_id,
+        "Job Site URL": wp_url or "",
+    }
+    if info:
+        updates.update({
+            "Short Description": make_short_description(info.get("description", "")),
+            "Location":          sanitize_text(info.get("location", "")),
+            "Job Type":          _pretty_job_type(info.get("job_type", "")),
+        })
+    _upsert_row(job_id, updates)
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
@@ -327,7 +393,7 @@ def mark_failed(job_id, reason):
 def print_tracker_summary():
     if not os.path.exists(PROCESSED_IDS_FILE):
         return
-    df = pd.read_csv(PROCESSED_IDS_FILE)
+    df = _read_tracker()
     print(f"\n{'═'*55}")
     print(f" TRACKER SUMMARY ({len(df)} total records)")
     print(f"{'═'*55}")
@@ -336,6 +402,37 @@ def print_tracker_summary():
     for status, count in counts.items():
         print(f" {icons.get(status,'⚪')} {status:<15} {count}")
     print(f"{'═'*55}\n")
+
+# ── Immediate tracker sync to the repo (GitHub Actions only) ────────────────
+# Without this the CSV only reaches the repo after the whole run finishes.
+# With it, the CSV is committed + pushed right after every posted job.
+GIT_PUSH_TRACKER = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
+def _git(*args, timeout: int = 60):
+    return subprocess.run(["git", *args], capture_output=True, text=True, timeout=timeout)
+
+def push_tracker_now(message: str):
+    """Commit and push the tracker CSV immediately. Never raises."""
+    if not GIT_PUSH_TRACKER:
+        return
+    try:
+        _git("config", "user.name",  "github-actions[bot]")
+        _git("config", "user.email", "github-actions[bot]@users.noreply.github.com")
+        _git("add", PROCESSED_IDS_FILE)
+        if _git("diff", "--cached", "--quiet").returncode == 0:
+            return  # nothing changed
+        _git("commit", "-m", f"{message} [skip ci]")
+        for attempt in range(4):
+            # Rebase first so pushes from other workflows don't reject ours
+            _git("pull", "--rebase", "--autostash")
+            push = _git("push")
+            if push.returncode == 0:
+                logger.info(f"📌 Tracker pushed: {message}")
+                return
+            logger.warning(f"Tracker push attempt {attempt+1} failed: {push.stderr.strip()[:200]}")
+            time.sleep(2 + attempt * 2)
+    except Exception as e:
+        logger.warning(f"push_tracker_now error: {e}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # STEP 8 — Mistral API
@@ -442,6 +539,7 @@ def paraphrase_description(text: str) -> str:
 
         print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
         print(f" │ │ ORIGINAL ({orig_wc} words):")
+        # Word-wrap original at ~100 chars
         orig_words = para.split()
         orig_line = []
         for w in orig_words:
@@ -476,6 +574,7 @@ def paraphrase_description(text: str) -> str:
             rw = len(result.split()) if result else 0
             sim = similarity_score(para, result) if result and rw >= 5 else 0.0
 
+            # Print paraphrased output word-wrapped
             if result:
                 print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
                 words = result.split()
@@ -514,6 +613,7 @@ def paraphrase_description(text: str) -> str:
             print(f" │ │ {'─'*60}")
             time.sleep(1)
 
+        # Fallback logic
         if accepted_text is None:
             print(f" │ │ {'─'*60}")
             if best_result and best_sim >= 0.40:
@@ -639,12 +739,9 @@ def paraphrase_tagline(text: str) -> str:
 # STEP 10 — WordPress helpers
 # ════════════════════════════════════════════════════════════════════════════
 def wp_headers():
-    # FIX: previously this returned only Authorization + Content-Type, with
-    # no X-Internal-Auth header at all — so this script's traffic could never
-    # be recognised as "trusted" by any Cloudflare rule checking for it,
-    # unlike the other two scrapers which already sent this header.
     token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
     headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    # Cloudflare WAF bypass header for every WordPress request (X-Internal-Auth)
     if INTERNAL_BOT_KEY:
         headers["X-Internal-Auth"] = INTERNAL_BOT_KEY
     return headers
@@ -740,7 +837,7 @@ def save_job(row: pd.Series, title: str, description: str) -> tuple:
     for jt_label in ["Full Time", "Part Time", "Contract",
                      "Temporary", "Freelance", "Internship", "Volunteer"]:
         get_or_create_term(f"{WP_BASE}/job_listing_type", jt_label)
-    location    = sanitize_text(str(row.get("Job Location", "Nigeria")))
+    location    = sanitize_text(str(row.get("Job Location", COUNTRY_NAME)))
     raw_type    = sanitize_text(str(row.get("Job Type", "Full-time")))
     job_type_s  = normalise_job_type(raw_type)
     company     = sanitize_text(str(row.get("Company Name", "")))
@@ -914,17 +1011,23 @@ def process_sheet():
         print(f"\n ✍️  Paraphrasing with Mistral…")
         new_title = paraphrase_title(title)
         new_desc  = paraphrase_description(desc)
-        _upsert_row(job_id, {"Status": "paraphrased"})
+        mark_paraphrased(job_id)
         print(f"\n 📤 Posting to WordPress…")
         post_id, post_url = save_job(row, new_title, new_desc)
         if post_id:
-            mark_posted(job_id, post_id, post_url or "")
+            mark_posted(job_id, post_id, post_url or "", {
+                "description": new_desc,
+                "location":    sanitize_text(str(row.get("Job Location", ""))),
+                "job_type":    sanitize_text(str(row.get("Job Type", ""))),
+            })
             posted_count += 1
             print(f" ✅ SUCCESS — WP ID={post_id} 🔗 {post_url}")
+            push_tracker_now(f"Tracker: posted {job_id}")
         else:
             mark_failed(job_id, "wp_post_failed")
             failed_count += 1
             print(f" ❌ WordPress post failed.")
+            push_tracker_now(f"Tracker: failed {job_id}")
         if (idx + 1) % 10 == 0:
             print(f"\n ⏸ Pausing 20s after every 10 jobs…")
             time.sleep(20)
@@ -940,6 +1043,6 @@ def process_sheet():
 # STEP 13 — Entry point
 # ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("\n🚀 MimusJobs — Starting with Mistral API…\n")
+    print(f"\n🚀 {COUNTRY_NAME} MimusJobs — Starting with Mistral API…\n")
     process_sheet()
     print("\n✅ Done. All jobs processed.")
